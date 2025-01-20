@@ -19,6 +19,11 @@ base_model = AutoModelForSequenceClassification.from_pretrained(
     "google-bert/bert-base-cased", num_labels=6
 )
 
+df = pd.read_csv("train.csv")
+
+X = df["comment_text"]
+y = df[["toxic", "severe_toxic", "obscene", "threat", "insult", "identity_hate"]]
+
 peft_config = LoraConfig(
     task_type=TaskType.SEQ_CLS,
     inference_mode=False,
@@ -35,11 +40,6 @@ optimizer = bnb.optim.AdamW8bit(model.parameters(), min_8bit_size=16384)
 if torch.cuda.is_available():
     device = torch.device("cuda")
     model.to(device)
-
-df = pd.read_csv("train.csv")
-
-X = df["comment_text"]
-y = df[["toxic", "severe_toxic", "obscene", "threat", "insult", "identity_hate"]]
 
 
 # Tokenize the text
@@ -79,35 +79,26 @@ progress_bar = tqdm(range(training_steps))
 
 
 # training loop
-
 for epoch in range(epochs):
     print(f"Epoch {epoch + 1}/{epochs}")
     total_loss = 0
 
-    # Training
     model.train()
     for batch in data_loader:
-        # Forward pass
         outputs = model(**batch)
         loss = outputs.loss
 
-        # Backward pass
         accelerator.backward(loss)
 
-        # Update parameters
         optimizer.step()
-        lr_scheduler.step()  # Move this outside the loop if using an epoch-based scheduler
+        lr_scheduler.step()  
         optimizer.zero_grad()
 
-        # Update progress bar
         progress_bar.update(1)
 
-        # Accumulate loss for logging
         total_loss += loss.item()
 
-    # Print average loss for the epoch
     avg_loss = total_loss / len(data_loader)
     print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}")
 
-# Close the progress bar
 progress_bar.close()
