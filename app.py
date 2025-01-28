@@ -1,89 +1,156 @@
 import streamlit as st
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch
+
+def load_model():
+    # Load model and tokenizer from Unitary's toxic-bert
+    model_name = "unitary/toxic-bert"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    return model, tokenizer
+
+def predict(model, tokenizer, text):
+    # Tokenize the input text
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128, padding=True)
+    
+    # Get model predictions
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predictions = torch.sigmoid(outputs.logits)
+    
+    # Convert to numpy for easier handling
+    predictions = predictions.numpy()[0]
+    
+    # Define the labels for toxic-bert
+    labels = [
+        "toxicity",
+        "severe_toxicity",
+        "obscene",
+        "threat",
+        "insult",
+        "identity_attack"
+    ]
+    
+    # Create results dictionary
+    results = {label: float(pred) for label, pred in zip(labels, predictions)}
+    return results
 
 def main():
-    # Set up the page configuration
+    # Page configuration
     st.set_page_config(
-        page_title="Hate Speech Detection",
-        page_icon="🔍",
-        layout="wide"
+        page_title="Toxic Comment Detection",
+        page_icon="🛡️",
+        layout="centered"
     )
 
-    # Create header
-    st.title("Hate Speech Detection App")
+    # Header
+    st.title("🛡️ Toxic Comment Detection")
     st.markdown("""
-    This app analyzes text for toxic content and provides classification for:
-    - Toxic
-    - Severe Toxic
-    - Obscene
-    - Threat
-    - Insult
-    - Identity Hate
+    This application analyzes text for different types of toxic content including:
+    - Toxicity
+    - Severe Toxicity
+    - Obscene Language
+    - Threats
+    - Insults
+    - Identity Attacks
     """)
 
-    # Initialize the model and tokenizer
-    @st.cache_resource
-    def load_model():
-        tokenizer = AutoTokenizer.from_pretrained("devesh1011/Upload_tokenizer")
-        model = AutoModelForSequenceClassification.from_pretrained(
-            "bert-base-cased",
-            num_labels=6
-        )
-        return pipeline(
-            "text-classification",
-            model=model,
-            tokenizer=tokenizer
-        )
-
-    # Load the model
+    # Load model
     try:
-        pipe = load_model()
-        
-        # Create text input
-        text_input = st.text_area(
-            "Enter your text here:",
-            height=200,
-            placeholder="Paste your text or article here..."
+        model, tokenizer = load_model()
+        print("Model loaded successfully!")
+
+        # Text input
+        user_input = st.text_area(
+            "Enter text to analyze:",
+            height=150,
+            placeholder="Type or paste your text here..."
         )
 
-        # Add analyze button
+        # Analysis button
         if st.button("Analyze Text"):
-            if text_input.strip() == "":
-                st.warning("Please enter some text to analyze.")
+            if not user_input.strip():
+                st.warning("⚠️ Please enter some text to analyze.")
             else:
                 with st.spinner("Analyzing text..."):
-                    # Get prediction
-                    result = pipe(text_input)
+                    # Get predictions
+                    results = predict(model, tokenizer, user_input)
+                    
+                    # Print results to terminal
+                    print("\n=== Model Results ===")
+                    print(f"Input Text: {user_input}")
+                    print("Predictions:")
+                    for label, score in results.items():
+                        print(f"{label}: {score:.4f}")
+                    print("==================\n")
                     
                     # Display results
                     st.subheader("Analysis Results")
                     
-                    # Create a color-coded box based on the prediction
-                    label = result[0]['label']
-                    score = result[0]['score']
+                    # Create columns for results
+                    cols = st.columns(2)
                     
-                    # Format the score as percentage
-                    score_percentage = f"{score:.2%}"
+                    # Display each category with its probability
+                    for idx, (label, score) in enumerate(results.items()):
+                        with cols[idx % 2]:
+                            # Determine color based on score
+                            if score < 0.3:
+                                color = "green"
+                                severity = "Low"
+                            elif score < 0.7:
+                                color = "orange"
+                                severity = "Moderate"
+                            else:
+                                color = "red"
+                                severity = "High"
+                            
+                            # Display score with formatting
+                            st.markdown(
+                                f"""
+                                <div style='padding: 10px; border-radius: 5px; border: 1px solid {color}'>
+                                <b>{label.replace('_', ' ').title()}:</b><br>
+                                Score: {score:.2%}<br>
+                                Severity: {severity}
+                                </div>
+                                """, 
+                                unsafe_allow_html=True
+                            )
                     
-                    # Display result with color coding
-                    if label == "LABEL_0":
-                        st.success(f"✅ This text appears to be NON-TOXIC (Confidence: {score_percentage})")
+                    # Overall assessment
+                    st.subheader("Overall Assessment")
+                    max_toxicity = max(results.values())
+                    if max_toxicity < 0.3:
+                        st.success("✅ This text appears to be generally safe and non-toxic.")
+                    elif max_toxicity < 0.7:
+                        st.warning("⚠️ This text contains potentially problematic content.")
                     else:
-                        st.error(f"⚠️ This text appears to be TOXIC (Confidence: {score_percentage})")
+                        st.error("🚫 This text contains highly toxic content.")
                     
-                    # Display detailed explanation
+                    # Add interpretation note
                     st.info("""
-                    Note: This analysis is based on machine learning and may not be 100% accurate. 
-                    The model evaluates the text for various forms of toxic content including hate speech, 
-                    threats, obscenity, insults, and identity-based attacks.
+                    💡 **Interpretation Guide:**
+                    - Green (Low): Less than 30% probability of toxic content
+                    - Orange (Moderate): 30-70% probability of toxic content
+                    - Red (High): More than 70% probability of toxic content
+                    
+                    Note: This is an AI model and may not be 100% accurate. Consider context and nuance when interpreting results.
                     """)
-    
+
     except Exception as e:
-        st.error(f"""
-        Error loading the model. Please try again later.
-        If the problem persists, contact support.
-        Technical details: {str(e)}
-        """)
+        error_msg = f"😕 Oops! Something went wrong: {str(e)}"
+        print(f"\nERROR: {error_msg}\n")
+        st.error(error_msg)
+
+    # Add footer
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style='text-align: center'>
+        <p>Built with Streamlit and Hugging Face Transformers 🤗</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 if __name__ == "__main__":
-    main() 
+    main()
