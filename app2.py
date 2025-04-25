@@ -1,17 +1,16 @@
 import streamlit as st
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 import torch
-import librosa
 import io
-import numpy as np
 from pydub import AudioSegment
+from elevenlabs import ElevenLabs
 
+
+# --- Configuration ---
 TOXICITY_MODEL_NAME = "unitary/toxic-bert"
-ASR_MODEL_NAME = "openai/whisper-large-v3-turbo"
-TARGET_SAMPLE_RATE = 16000
 
 
+# --- Caching Toxicity Model ---
 @st.cache_resource
 def load_toxicity_model():
     """Loads the Text Classification model and tokenizer."""
@@ -22,32 +21,23 @@ def load_toxicity_model():
     return model, tokenizer
 
 
-@st.cache_resource
-def load_asr_model():
-    """Loads the Automatic Speech Recognition model and processor."""
-    print(f"Loading ASR model: {ASR_MODEL_NAME}")
-    processor = AutoProcessor.from_pretrained(ASR_MODEL_NAME)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        ASR_MODEL_NAME,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-    )
-    model.to(device)
-
-    print(f"ASR model loaded successfully on {device}!")
-    return processor, model, device
-
-
+# --- Prediction Functions ---
 def predict_toxicity(model, tokenizer, text):
     """Predicts toxicity scores for the given text."""
     inputs = tokenizer(
-        text, return_tensors="pt", truncation=True, max_length=512, padding=True
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        padding=True,
+        return_attention_mask=True,
     )
-    if next(model.parameters()).is_cuda:
+
+    if (
+        model.parameters()
+        and next(model.parameters(), None) is not None
+        and next(model.parameters()).is_cuda
+    ):
         inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
     with torch.no_grad():
@@ -67,103 +57,65 @@ def predict_toxicity(model, tokenizer, text):
     return results
 
 
-def transcribe_audio(asr_processor, asr_model, device, audio_bytes):
-    """Transcribes audio bytes to text using the ASR model."""
-    if not audio_bytes:
-        return ""
-    try:
-        audio_stream = io.BytesIO(audio_bytes)
-        try:
-            audio_segment = AudioSegment.from_file(audio_stream)
-            print(
-                f"pydub successfully loaded audio. Frame rate: {audio_segment.frame_rate}, Channels: {audio_segment.channels}"
-            )
-        except Exception as pydub_error:
-            st.error(
-                f"pydub failed to load audio: {pydub_error}. Ensure ffmpeg is installed and in PATH."
-            )
-            print(f"pydub failed: {pydub_error}")
-            return "[Transcription Error: pydub load failed]"
+def transcribe_audio_elevenlabs(api_key, audio_bytes):
+    """Transcribes audio bytes to text using the Eleven Labs STT API."""
+    # 1. Read audio bytes using pydub
+    audio_stream = io.BytesIO(audio_bytes)
+    audio_segment = AudioSegment.from_file(audio_stream)
 
-        wav_stream = io.BytesIO()
-        audio_segment.export(wav_stream, format="wav")
-        wav_stream.seek(0)
+    # 2. Convert to WAV format in memory
+    wav_stream = io.BytesIO()
+    audio_segment.export(wav_stream, format="wav")
+    wav_stream.seek(0)
 
-        speech_array, sampling_rate = librosa.load(wav_stream, sr=TARGET_SAMPLE_RATE)
+    # 3. Initialize Eleven Labs client and send audio
+    client = ElevenLabs(api_key=api_key)
 
-        speech_array = librosa.to_mono(speech_array)
-        if speech_array.dtype != np.float32:
-            speech_array = speech_array.astype(np.float32)
-        print(
-            f"Librosa successfully loaded WAV. Original SR (from WAV): {sampling_rate}, Target SR: {TARGET_SAMPLE_RATE}, Array shape: {speech_array.shape}"
-        )
+    # 4. Sending data to eleven labs for transcription
+    response = client.speech_to_text.convert(
+        file=(f"recording.wav", wav_stream),
+        model_id="scribe_v1",
+        language_code="eng",
+    )
 
-        input_features = asr_processor(
-            speech_array, sampling_rate=TARGET_SAMPLE_RATE, return_tensors="pt"
-        ).input_features
-        input_features = input_features.to(device)
-        if asr_model.dtype == torch.float16:
-            input_features = input_features.half()
+    transcription = response.text
 
-        with torch.no_grad():
-            if isinstance(asr_model, AutoModelForSpeechSeq2Seq):
-                predicted_ids = asr_model.generate(input_features, max_new_tokens=128)
-            else:
-                st.error("Unsupported ASR model type for generation.")
-                return "[Transcription Error: Model type]"
-
-        transcription = asr_processor.batch_decode(
-            predicted_ids, skip_special_tokens=True
-        )[0]
-
-        print(f"Transcription: {transcription}")
-        return transcription.strip()
-
-    except Exception as e:
-        st.error(f"Error during transcription: {e}")
-        import traceback
-
-        print("--- Transcription Error Traceback ---")
-        traceback.print_exc()
-        print("------------------------------------")
-        return "[Transcription Error]"
+    return transcription.strip()
 
 
+# --- Main Streamlit App ---
 def main():
+    # Page configuration
     st.set_page_config(
         page_title="Toxic Content Detection", page_icon="🛡️", layout="centered"
     )
 
+    # Header
     st.title("🛡️ Toxic Content Detection")
     st.markdown(
         """
-    Analyze text for toxicity, or record audio to transcribe and analyze.
+    Analyze text for toxicity, or record audio to transcribe and analyze using Eleven Labs.
     Supports detection of:
     - Toxicity - Severe Toxicity - Obscene Language - Threats - Insults - Identity Attacks
     """
     )
-    st.info(
-        "🚨 **Note:** Audio processing requires `ffmpeg` installed on your system and available in your PATH."
-    )
+    toxicity_model, toxicity_tokenizer = load_toxicity_model()
 
-    try:
-        toxicity_model, toxicity_tokenizer = load_toxicity_model()
-        asr_processor, asr_model, asr_device = load_asr_model()
-    except Exception as e:
-        error_msg = f"😕 Oops! Could not load models: {str(e)}"
-        print(f"\nERROR: {error_msg}\n")
-        st.error(error_msg)
-        st.stop()
+    # Get Eleven Labs API Key from Streamlit secrets
+    elevenlabs_api_key = st.secrets.get("ELEVENLABS_API_KEY")
 
+    # --- Initialize Session State for Text ---
     if "text_input" not in st.session_state:
         st.session_state.text_input = ""
     if "analysis_results" not in st.session_state:
         st.session_state.analysis_results = None
     if "last_input_type" not in st.session_state:
-        st.session_state.last_input_type = "text"  # or 'voice'
+        st.session_state.last_input_type = "text"
 
-    tab1, tab2 = st.tabs(["📝 Text Input", "🎤 Voice Input"])
+    # --- Input Methods ---
+    tab1, tab2 = st.tabs(["📝 Text Input", "🎤 Voice Input (Eleven Labs)"])
 
+    # --- Text Input Tab ---
     with tab1:
         text_area_input = st.text_area(
             "Enter text to analyze:",
@@ -176,36 +128,30 @@ def main():
                 else ""
             ),
         )
-        if text_area_input != st.session_state.text_input and text_area_input:
+        if text_area_input != st.session_state.text_input and text_area_input.strip():
             st.session_state.text_input = text_area_input
             st.session_state.last_input_type = "text"
             if "analysis_results" in st.session_state:
                 st.session_state.analysis_results = None
 
+    # --- Voice Input Tab ---
     with tab2:
         st.write("Click the microphone icon to start/stop recording:")
-        audio_info = None  # Initialize
-        try:
-            from streamlit_mic_recorder import mic_recorder
+        audio_info = None
+        from streamlit_mic_recorder import mic_recorder
 
-            audio_info = mic_recorder(
-                start_prompt="⏺️ Start Recording",
-                stop_prompt="⏹️ Stop Recording",
-                key="voice_recorder",
-            )
-        except ImportError:
-            st.error(
-                "`streamlit-mic-recorder` not installed. Please run `pip install streamlit-mic-recorder`"
-            )
-        except Exception as e:
-            st.error(f"Error initializing microphone recorder: {e}")
+        audio_info = mic_recorder(
+            start_prompt="⏺️ Start Recording",
+            stop_prompt="⏹️ Stop Recording",
+            key="voice_recorder_elevenlabs",
+        )
 
         if audio_info and audio_info.get("bytes"):
             st.audio(audio_info["bytes"], format="audio/wav")
             audio_bytes = audio_info["bytes"]
-            with st.spinner("Transcribing audio... Please wait."):
-                transcribed_text = transcribe_audio(
-                    asr_processor, asr_model, asr_device, audio_bytes
+            with st.spinner("Sending audio to Eleven Labs for transcription..."):
+                transcribed_text = transcribe_audio_elevenlabs(
+                    elevenlabs_api_key, audio_bytes
                 )
 
             if transcribed_text and not transcribed_text.startswith(
@@ -236,9 +182,10 @@ def main():
             if "analysis_results" in st.session_state:
                 st.session_state.analysis_results = None
 
+    # --- Analysis Section ---
     st.divider()
 
-    if st.button("Analyze Text", key="analyze_button"):
+    if st.button("Analyze Text", key="analyze_button_elevenlabs"):
         text_to_analyze = st.session_state.get("text_input", "").strip()
 
         if not text_to_analyze:
@@ -249,18 +196,21 @@ def main():
                     results = predict_toxicity(
                         toxicity_model, toxicity_tokenizer, text_to_analyze
                     )
-                    st.session_state.analysis_results = results  # Store results
+                    st.session_state.analysis_results = results
+
                     print("\n=== Model Results ===")
                     print(f"Input Text: {text_to_analyze}")
                     print("Predictions:")
                     for label, score in results.items():
                         print(f"{label}: {score:.4f}")
                     print("==================\n")
+
                 except Exception as analysis_error:
                     st.error(f"Error during toxicity analysis: {analysis_error}")
                     print(f"Analysis Error: {analysis_error}")
                     st.session_state.analysis_results = None
 
+    # --- Display Results ---
     if st.session_state.get("analysis_results"):
         results = st.session_state.analysis_results
         st.subheader("Analysis Results")
@@ -306,7 +256,6 @@ def main():
         f"""
         <div style='text-align: center'>
         <p>Built with Streamlit & Hugging Face 🤗</p>
-        <p><small>ASR: {ASR_MODEL_NAME} | Toxicity: {TOXICITY_MODEL_NAME}</small></p>
         </div>
         """,
         unsafe_allow_html=True,

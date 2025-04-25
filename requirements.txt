@@ -3,3 +3,4 @@ transformers
 torch
 protobuf
 safetensors
+SpeechRecognition
